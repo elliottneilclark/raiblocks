@@ -9,6 +9,8 @@
 
 #include <blake2/blake2.h>
 
+#include <rocksdb/db.h>
+
 namespace boost
 {
 template <>
@@ -145,6 +147,7 @@ public:
 	vote (bool &, rai::stream &, rai::block_type);
 	vote (rai::account const &, rai::raw_key const &, uint64_t, std::shared_ptr<rai::block>);
 	vote (MDB_val const &);
+  vote (std::string const &);
 	rai::uint256_union hash () const;
 	bool operator== (rai::vote const &) const;
 	bool operator!= (rai::vote const &) const;
@@ -177,9 +180,10 @@ public:
 	block_store (bool &, boost::filesystem::path const &, int lmdb_max_dbs = 128);
 
 	MDB_dbi block_database (rai::block_type);
+        rocksdb::DB * get_db (rai::block_type);
 	void block_put_raw (MDB_txn *, MDB_dbi, rai::block_hash const &, MDB_val);
 	void block_put (MDB_txn *, rai::block_hash const &, rai::block const &, rai::block_hash const & = rai::block_hash (0));
-	MDB_val block_get_raw (MDB_txn *, rai::block_hash const &, rai::block_type &);
+        std::string block_get_raw (MDB_txn *, rai::block_hash const &, rai::block_type &);
 	rai::block_hash block_successor (MDB_txn *, rai::block_hash const &);
 	void block_successor_clear (MDB_txn *, rai::block_hash const &);
 	std::unique_ptr<rai::block> block_get (MDB_txn *, rai::block_hash const &);
@@ -280,32 +284,46 @@ public:
 	rai::mdb_env environment;
 	// block_hash -> account                                        // Maps head blocks to owning account
 	MDB_dbi frontiers;
+        std::unique_ptr<rocksdb::DB> frontiers_db;
 	// account -> block_hash, representative, balance, timestamp    // Account to head block, representative, balance, last_change
 	MDB_dbi accounts;
+        std::unique_ptr<rocksdb::DB> accounts_db;
 	// block_hash -> send_block
 	MDB_dbi send_blocks;
+        std::unique_ptr<rocksdb::DB> send_blocks_db;
 	// block_hash -> receive_block
 	MDB_dbi receive_blocks;
+        std::unique_ptr<rocksdb::DB> receive_blocks_db;
 	// block_hash -> open_block
 	MDB_dbi open_blocks;
+        std::unique_ptr<rocksdb::DB> open_blocks_db;
 	// block_hash -> change_block
 	MDB_dbi change_blocks;
+        std::unique_ptr<rocksdb::DB> change_blocks_db;
 	// block_hash -> sender, amount, destination                    // Pending blocks to sender account, amount, destination account
 	MDB_dbi pending;
+        std::unique_ptr<rocksdb::DB> pending_db;
 	// block_hash -> account, balance                               // Blocks info
 	MDB_dbi blocks_info;
+        std::unique_ptr<rocksdb::DB> blocks_info_db;
 	// account -> weight                                            // Representation
 	MDB_dbi representation;
+        std::unique_ptr<rocksdb::DB> representation_db;
 	// block_hash -> block                                          // Unchecked bootstrap blocks
 	MDB_dbi unchecked;
+        std::unique_ptr<rocksdb::DB> unchecked_db;
 	// block_hash ->                                                // Blocks that haven't been broadcast
 	MDB_dbi unsynced;
+        std::unique_ptr<rocksdb::DB> unsynced_db;
 	// (uint56_t, uint8_t) -> block_hash                            // Mapping of region to checksum
 	MDB_dbi checksum;
+        std::unique_ptr<rocksdb::DB> checksum_db;
 	// account -> uint64_t											// Highest vote observed for account
 	MDB_dbi vote;
+        std::unique_ptr<rocksdb::DB> vote_db;
 	// uint256_union -> ?											// Meta information about block store
 	MDB_dbi meta;
+        std::unique_ptr<rocksdb::DB> meta_db;
 };
 enum class process_result
 {

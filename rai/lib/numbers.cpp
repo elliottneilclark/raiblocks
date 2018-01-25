@@ -196,6 +196,44 @@ std::string rai::uint256_union::to_string () const
 	return result;
 }
 
+rocksdb::Slice rai::uint128_union::to_slice () const {
+  const char* ptr = reinterpret_cast<const char*>(bytes.data());
+  return rocksdb::Slice{ptr, sizeof(bytes)};
+}
+rai::uint128_union rai::uint128_union::from_raw_string(std::string r) {
+  rai::uint128_union result;
+  std::copy (
+    reinterpret_cast<uint8_t const *> (r.data ()), 
+    reinterpret_cast<uint8_t const *> (r.data ()) + sizeof (result.bytes), 
+    result.bytes.data ());
+  return result;
+}
+rocksdb::Slice rai::uint256_union::to_slice () const {
+  const char* ptr = reinterpret_cast<const char*>(bytes.data());
+  return rocksdb::Slice{ptr, sizeof(bytes)};
+}
+
+rai::uint256_union rai::uint256_union::from_raw_string(std::string r) {
+  rai::uint256_union result;
+  std::copy (
+    reinterpret_cast<uint8_t const *> (r.data ()), 
+    reinterpret_cast<uint8_t const *> (r.data ()) + sizeof (result.bytes), 
+    result.bytes.data ());
+  return result;
+}
+rocksdb::Slice rai::uint512_union::to_slice () const {
+  const char* ptr = reinterpret_cast<const char*>(bytes.data());
+  return rocksdb::Slice{ptr, sizeof(bytes)};
+}
+rai::uint512_union rai::uint512_union::from_raw_string(std::string r) {
+  rai::uint512_union result;
+  std::copy (
+    reinterpret_cast<uint8_t const *> (r.data ()), 
+    reinterpret_cast<uint8_t const *> (r.data ()) + sizeof (result.bytes), 
+    result.bytes.data ());
+  return result;
+}
+
 bool rai::uint256_union::operator< (rai::uint256_union const & other_a) const
 {
 	return number () < other_a.number ();

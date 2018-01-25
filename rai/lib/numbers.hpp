@@ -3,6 +3,7 @@
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <cryptopp/osrng.h>
+#include <rocksdb/slice.h>
 
 namespace rai
 {
@@ -23,6 +24,7 @@ rai::uint128_t const uxrb_ratio = rai::uint128_t ("1000000000000000000"); // 10^
 union uint128_union
 {
 public:
+  static uint128_union from_raw_string(std::string s);
 	uint128_union () = default;
 	uint128_union (std::string const &);
 	uint128_union (uint64_t);
@@ -43,6 +45,7 @@ public:
 	bool is_zero () const;
 	std::string to_string () const;
 	std::string to_string_dec () const;
+  rocksdb::Slice to_slice() const;
 	std::array<uint8_t, 16> bytes;
 	std::array<char, 16> chars;
 	std::array<uint32_t, 4> dwords;
@@ -53,6 +56,7 @@ using amount = uint128_union;
 class raw_key;
 union uint256_union
 {
+  static uint256_union from_raw_string(std::string s);
 	uint256_union () = default;
 	uint256_union (std::string const &);
 	uint256_union (uint64_t);
@@ -79,6 +83,7 @@ union uint256_union
 	std::array<uint128_union, 2> owords;
 	void clear ();
 	bool is_zero () const;
+  rocksdb::Slice to_slice() const;
 	std::string to_string () const;
 	rai::uint256_t number () const;
 };
@@ -104,6 +109,7 @@ public:
 };
 union uint512_union
 {
+  static uint512_union from_raw_string(std::string s);
 	uint512_union () = default;
 	uint512_union (rai::uint512_t const &);
 	bool operator== (rai::uint512_union const &) const;
@@ -118,6 +124,7 @@ union uint512_union
 	void clear ();
 	rai::uint512_t number () const;
 	std::string to_string () const;
+  rocksdb::Slice to_slice() const;
 };
 // Only signatures are 512 bit.
 using signature = uint512_union;

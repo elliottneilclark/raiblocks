@@ -14,3 +14,9 @@
 [submodule "phc-winner-argon2"]
 	path = phc-winner-argon2
 	url = https://github.com/clemahieu/phc-winner-argon2.git
+[submodule "rocksdb"]
+        path = rocksdb
+        url = https://github.com/facebook/rocksdb.git
+[submodule "zstd"]
+        path = zstd
+        url = https://github.com/facebook/zstd.git

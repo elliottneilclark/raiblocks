@@ -7,7 +7,11 @@
 
 #include <boost/property_tree/json_parser.hpp>
 
+#include <iostream>
 #include <queue>
+#include <rocksdb/filter_policy.h>
+#include <rocksdb/options.h>
+#include <rocksdb/table.h>
 
 #include <ed25519-donna/ed25519.h>
 
@@ -467,7 +471,19 @@ blocks_info (0),
 representation (0),
 unchecked (0),
 unsynced (0),
-checksum (0)
+checksum (0),
+frontiers_db (nullptr),
+accounts_db (nullptr),
+send_blocks_db (nullptr),
+receive_blocks_db (nullptr),
+open_blocks_db (nullptr),
+change_blocks_db (nullptr),
+pending_db (nullptr),
+blocks_info_db (nullptr),
+representation_db (nullptr),
+unchecked_db (nullptr),
+unsynced_db (nullptr),
+checksum_db (nullptr)
 {
 	if (!error_a)
 	{
@@ -486,11 +502,170 @@ checksum (0)
 		error_a |= mdb_dbi_open (transaction, "checksum", MDB_CREATE, &checksum) != 0;
 		error_a |= mdb_dbi_open (transaction, "vote", MDB_CREATE, &vote) != 0;
 		error_a |= mdb_dbi_open (transaction, "meta", MDB_CREATE, &meta) != 0;
-		if (!error_a)
-		{
-			do_upgrades (transaction);
-			checksum_put (transaction, 0, 0, 0);
-		}
+	}
+
+	if (!error_a)
+	{
+		auto p = path_a;
+		p.remove_leaf ();
+		// For now we will configure all the different RocksDB's to be the same
+		// However likely they will need different params once we start tuning.
+		rocksdb::Options options;
+
+		// If this is the first time this is run then create the empty db's
+		options.create_if_missing = true;
+
+		// Use direct io so we don't pollte the page cache
+		options.use_direct_io_for_flush_and_compaction = true;
+
+		// Use zstd compression
+		// TODO(elliott): Figure out if we need to use lz4 on lower levels
+		options.compression = rocksdb::CompressionType::kZSTD;
+
+		// Use universal compaction with 64MB of memory for write buffer
+		options.OptimizeUniversalStyleCompaction (64 * 1024 * 1024);
+		options.num_levels = 5;
+		// Chose a small readahead size since we don't know if this is on ssd
+		// where the readahead will gain us nothing, or on disk where it will be
+		// awesome.
+		options.compaction_readahead_size = 1 * 1024 * 1024;
+
+		// In the background sync every 8 megs so that io latencies don't spike
+		options.bytes_per_sync = 8 * 1024 * 1024;
+		options.wal_bytes_per_sync = 1 * 1024 * 1024;
+
+		// TODO(elliott): Make ths smarter. Configurable?
+		options.IncreaseParallelism (8);
+		options.enable_pipelined_write = true;
+
+		// This is probably a premature optimization, but set up
+		// rocks db to have a shared cache and use the cache for index/filter blocks.
+		//
+		// Most of these options come from:
+		// https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
+		rocksdb::BlockBasedTableOptions table_options;
+
+		// Partition index and bloom filters
+		table_options.index_type = rocksdb::BlockBasedTableOptions::IndexType::kTwoLevelIndexSearch;
+		table_options.partition_filters = true;
+
+		// Keep the root in heap not in cache.
+		table_options.cache_index_and_filter_blocks = false;
+
+		table_options.pin_l0_filter_and_index_blocks_in_cache = true;
+		table_options.block_cache = rocksdb::NewLRUCache (512 * 1024 * 1024, 8);
+		table_options.block_size = 16 * 1024;
+		table_options.metadata_block_size = 16 * 1024;
+		table_options.filter_policy.reset (rocksdb::NewBloomFilterPolicy (10, false));
+
+		options.table_factory.reset (rocksdb::NewBlockBasedTableFactory (table_options));
+
+		rocksdb::DB * temp_db = nullptr;
+
+		auto s = rocksdb::DB::Open (options,
+		(p / "frontiers").string (),
+		&temp_db);
+		assert (s.ok ());
+		error_a |= !s.ok ();
+		frontiers_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "accounts").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		accounts_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "send_blocks").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		send_blocks_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "receive_blocks").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		receive_blocks_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "open_blocks").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		open_blocks_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "change_blocks").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		change_blocks_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "pending").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		pending_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "blocks_info").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		blocks_info_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "representation").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		representation_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "unchecked").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		unchecked_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "unsynced").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		unsynced_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "checksum").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		checksum_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "vote").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		vote_db.reset (temp_db);
+		temp_db = nullptr;
+
+		s = rocksdb::DB::Open (options,
+		(p / "meta").string (),
+		&temp_db);
+		error_a |= !s.ok ();
+		meta_db.reset (temp_db);
+		temp_db = nullptr;
+	}
+	if (!error_a)
+	{
+		rai::transaction transaction (environment, nullptr, true);
+		do_upgrades (transaction);
+		checksum_put (transaction, 0, 0, 0);
 	}
 }
 
@@ -500,21 +675,27 @@ void rai::block_store::version_put (MDB_txn * transaction_a, int version_a)
 	rai::uint256_union version_value (version_a);
 	auto status (mdb_put (transaction_a, meta, rai::mdb_val (version_key), rai::mdb_val (version_value), 0));
 	assert (status == 0);
+
+	rocksdb::Slice ks = version_key.to_slice ();
+	rocksdb::Slice vs = version_value.to_slice ();
+	auto s = meta_db->Put (rocksdb::WriteOptions (), ks, vs);
+	assert (s.ok ());
 }
 
 int rai::block_store::version_get (MDB_txn * transaction_a)
 {
 	rai::uint256_union version_key (1);
-	rai::mdb_val data;
-	auto error (mdb_get (transaction_a, meta, rai::mdb_val (version_key), data));
+	std::string val{};
+	rocksdb::Slice ks = version_key.to_slice ();
+	auto s = meta_db->Get (rocksdb::ReadOptions (), ks, &val);
 	int result;
-	if (error == MDB_NOTFOUND)
+	if (s.IsNotFound ())
 	{
 		result = 1;
 	}
 	else
 	{
-		rai::uint256_union version_value (data.uint256 ());
+		rai::uint256_union version_value = rai::uint256_union::from_raw_string (val);
 		assert (version_value.qwords[2] == 0 && version_value.qwords[1] == 0 && version_value.qwords[0] == 0);
 		result = version_value.number ().convert_to<int> ();
 	}
@@ -806,10 +987,17 @@ public:
 		auto hash (block_a.hash ());
 		rai::block_type type;
 		auto value (store.block_get_raw (transaction, block_a.previous (), type));
-		assert (value.mv_size != 0);
-		std::vector<uint8_t> data (static_cast<uint8_t *> (value.mv_data), static_cast<uint8_t *> (value.mv_data) + value.mv_size);
+		assert (!value.empty ());
+		std::vector<uint8_t> data (reinterpret_cast<const uint8_t *> (value.data ()), reinterpret_cast<const uint8_t *> (value.data ()) + value.size ());
 		std::copy (hash.bytes.begin (), hash.bytes.end (), data.end () - hash.bytes.size ());
 		store.block_put_raw (transaction, store.block_database (type), block_a.previous (), rai::mdb_val (data.size (), data.data ()));
+
+		auto db = store.get_db (type);
+		auto prev = block_a.previous ();
+		rocksdb::Slice ks = prev.to_slice ();
+		rocksdb::Slice vs{ reinterpret_cast<const char *> (data.data ()), data.size () };
+		auto s = db->Put (rocksdb::WriteOptions (), ks, vs);
+		assert (s.ok ());
 	}
 	void send_block (rai::send_block const & block_a) override
 	{
@@ -856,6 +1044,30 @@ MDB_dbi rai::block_store::block_database (rai::block_type type_a)
 	return result;
 }
 
+rocksdb::DB * rai::block_store::get_db (rai::block_type type_a)
+{
+	rocksdb::DB * result = nullptr;
+	switch (type_a)
+	{
+		case rai::block_type::send:
+			result = send_blocks_db.get ();
+			break;
+		case rai::block_type::receive:
+			result = receive_blocks_db.get ();
+			break;
+		case rai::block_type::open:
+			result = open_blocks_db.get ();
+			break;
+		case rai::block_type::change:
+			result = change_blocks_db.get ();
+			break;
+		default:
+			assert (false);
+			break;
+	}
+	return result;
+}
+
 void rai::block_store::block_put_raw (MDB_txn * transaction_a, MDB_dbi database_a, rai::block_hash const & hash_a, MDB_val value_a)
 {
 	auto status2 (mdb_put (transaction_a, database_a, rai::mdb_val (hash_a), &value_a, 0));
@@ -872,29 +1084,38 @@ void rai::block_store::block_put (MDB_txn * transaction_a, rai::block_hash const
 		rai::write (stream, successor_a.bytes);
 	}
 	block_put_raw (transaction_a, block_database (block_a.type ()), hash_a, { vector.size (), vector.data () });
+
+	// Write to rocks db
+	auto db = get_db (block_a.type ());
+	rocksdb::Slice ks = hash_a.to_slice ();
+	rocksdb::Slice vs{ reinterpret_cast<const char *> (vector.data ()), vector.size () };
+	auto s = db->Put (rocksdb::WriteOptions (), ks, vs);
+	assert (s.ok ());
+
 	set_predecessor predecessor (transaction_a, *this);
 	block_a.visit (predecessor);
 	assert (block_a.previous ().is_zero () || block_successor (transaction_a, block_a.previous ()) == hash_a);
 }
 
-MDB_val rai::block_store::block_get_raw (MDB_txn * transaction_a, rai::block_hash const & hash_a, rai::block_type & type_a)
+std::string rai::block_store::block_get_raw (MDB_txn * transaction_a, rai::block_hash const & hash_a, rai::block_type & type_a)
 {
-	rai::mdb_val result;
-	auto status (mdb_get (transaction_a, send_blocks, rai::mdb_val (hash_a), result));
-	assert (status == 0 || status == MDB_NOTFOUND);
-	if (status != 0)
+	std::string val{};
+	rocksdb::Slice ks = hash_a.to_slice ();
+	auto s = send_blocks_db->Get (rocksdb::ReadOptions (), ks, &val);
+	assert (s.ok () || s.IsNotFound ());
+	if (s.IsNotFound ())
 	{
-		auto status (mdb_get (transaction_a, receive_blocks, rai::mdb_val (hash_a), result));
-		assert (status == 0 || status == MDB_NOTFOUND);
-		if (status != 0)
+		s = receive_blocks_db->Get (rocksdb::ReadOptions (), ks, &val);
+		assert (s.ok () || s.IsNotFound ());
+		if (s.IsNotFound ())
 		{
-			auto status (mdb_get (transaction_a, open_blocks, rai::mdb_val (hash_a), result));
-			assert (status == 0 || status == MDB_NOTFOUND);
-			if (status != 0)
+			s = open_blocks_db->Get (rocksdb::ReadOptions (), ks, &val);
+			assert (s.ok () || s.IsNotFound ());
+			if (s.IsNotFound ())
 			{
-				auto status (mdb_get (transaction_a, change_blocks, rai::mdb_val (hash_a), result));
-				assert (status == 0 || status == MDB_NOTFOUND);
-				if (status == 0)
+				s = change_blocks_db->Get (rocksdb::ReadOptions (), ks, &val);
+				assert (s.ok () || s.IsNotFound ());
+				if (s.ok ())
 				{
 					type_a = rai::block_type::change;
 				}
@@ -913,7 +1134,7 @@ MDB_val rai::block_store::block_get_raw (MDB_txn * transaction_a, rai::block_has
 	{
 		type_a = rai::block_type::send;
 	}
-	return result;
+	return val;
 }
 
 std::unique_ptr<rai::block> rai::block_store::block_random (MDB_txn * transaction_a, MDB_dbi database)
@@ -967,10 +1188,10 @@ rai::block_hash rai::block_store::block_successor (MDB_txn * transaction_a, rai:
 	rai::block_type type;
 	auto value (block_get_raw (transaction_a, hash_a, type));
 	rai::block_hash result;
-	if (value.mv_size != 0)
+	if (!value.empty ())
 	{
-		assert (value.mv_size >= result.bytes.size ());
-		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.mv_data) + value.mv_size - result.bytes.size (), result.bytes.size ());
+		assert (value.size () >= result.bytes.size ());
+		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data ()) + value.size () - result.bytes.size (), result.bytes.size ());
 		auto error (rai::read (stream, result.bytes));
 		assert (!error);
 	}
@@ -992,9 +1213,9 @@ std::unique_ptr<rai::block> rai::block_store::block_get (MDB_txn * transaction_a
 	rai::block_type type;
 	auto value (block_get_raw (transaction_a, hash_a, type));
 	std::unique_ptr<rai::block> result;
-	if (value.mv_size != 0)
+	if (!value.empty ())
 	{
-		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.mv_data), value.mv_size);
+		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data ()), value.size ());
 		result = rai::deserialize_block (stream, type);
 		assert (result != nullptr);
 	}
@@ -1020,30 +1241,44 @@ void rai::block_store::block_del (MDB_txn * transaction_a, rai::block_hash const
 			}
 		}
 	}
+
+	rocksdb::Slice ks = hash_a.to_slice ();
+	auto s = send_blocks_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
+
+	s = receive_blocks_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
+
+	s = open_blocks_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
+
+	s = change_blocks_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
 }
 
 bool rai::block_store::block_exists (MDB_txn * transaction_a, rai::block_hash const & hash_a)
 {
 	auto result (true);
-	rai::mdb_val junk;
-	auto status (mdb_get (transaction_a, send_blocks, rai::mdb_val (hash_a), junk));
-	assert (status == 0 || status == MDB_NOTFOUND);
-	result = status == 0;
+	std::string val{};
+	auto ks = rocksdb::Slice{ reinterpret_cast<const char *> (&hash_a), sizeof (hash_a) };
+	auto s = send_blocks_db->Get (rocksdb::ReadOptions (), ks, &val);
+	assert (s.ok () || s.IsNotFound ());
+	result = s.ok ();
 	if (!result)
 	{
-		auto status (mdb_get (transaction_a, receive_blocks, rai::mdb_val (hash_a), junk));
-		assert (status == 0 || status == MDB_NOTFOUND);
-		result = status == 0;
+		s = receive_blocks_db->Get (rocksdb::ReadOptions (), ks, &val);
+		assert (s.ok () || s.IsNotFound ());
+		result = s.ok ();
 		if (!result)
 		{
-			auto status (mdb_get (transaction_a, open_blocks, rai::mdb_val (hash_a), junk));
-			assert (status == 0 || status == MDB_NOTFOUND);
-			result = status == 0;
+			s = open_blocks_db->Get (rocksdb::ReadOptions (), ks, &val);
+			assert (s.ok () || s.IsNotFound ());
+			result = s.ok ();
 			if (!result)
 			{
-				auto status (mdb_get (transaction_a, change_blocks, rai::mdb_val (hash_a), junk));
-				assert (status == 0 || status == MDB_NOTFOUND);
-				result = status == 0;
+				s = change_blocks_db->Get (rocksdb::ReadOptions (), ks, &val);
+				assert (s.ok () || s.IsNotFound ());
+				result = s.ok ();
 			}
 		}
 	}
@@ -1076,6 +1311,10 @@ void rai::block_store::account_del (MDB_txn * transaction_a, rai::account const 
 {
 	auto status (mdb_del (transaction_a, accounts, rai::mdb_val (account_a), nullptr));
 	assert (status == 0);
+
+	rocksdb::Slice ks = account_a.to_slice ();
+	auto s = accounts_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
 }
 
 bool rai::block_store::account_exists (MDB_txn * transaction_a, rai::account const & account_a)
@@ -1086,17 +1325,18 @@ bool rai::block_store::account_exists (MDB_txn * transaction_a, rai::account con
 
 bool rai::block_store::account_get (MDB_txn * transaction_a, rai::account const & account_a, rai::account_info & info_a)
 {
-	rai::mdb_val value;
-	auto status (mdb_get (transaction_a, accounts, rai::mdb_val (account_a), value));
-	assert (status == 0 || status == MDB_NOTFOUND);
+	rocksdb::Slice ks = account_a.to_slice ();
+	std::string val{};
+	auto s = accounts_db->Get (rocksdb::ReadOptions (), ks, &val);
+	assert (s.ok () || s.IsNotFound ());
 	bool result;
-	if (status == MDB_NOTFOUND)
+	if (s.IsNotFound ())
 	{
 		result = true;
 	}
 	else
 	{
-		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data ()), value.size ());
+		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (val.data ()), val.size ());
 		result = info_a.deserialize (stream);
 		assert (!result);
 	}
@@ -1107,17 +1347,23 @@ void rai::block_store::frontier_put (MDB_txn * transaction_a, rai::block_hash co
 {
 	auto status (mdb_put (transaction_a, frontiers, rai::mdb_val (block_a), rai::mdb_val (account_a), 0));
 	assert (status == 0);
+
+	rocksdb::Slice ks = block_a.to_slice ();
+	rocksdb::Slice vs = account_a.to_slice ();
+	auto s = frontiers_db->Put (rocksdb::WriteOptions (), ks, vs);
+	assert (s.ok ());
 }
 
 rai::account rai::block_store::frontier_get (MDB_txn * transaction_a, rai::block_hash const & block_a)
 {
-	rai::mdb_val value;
-	auto status (mdb_get (transaction_a, frontiers, rai::mdb_val (block_a), value));
-	assert (status == 0 || status == MDB_NOTFOUND);
+	std::string val{};
+	rocksdb::Slice ks = block_a.to_slice ();
+	auto s = frontiers_db->Get (rocksdb::ReadOptions (), ks, &val);
+	assert (s.ok () || s.IsNotFound ());
 	rai::account result (0);
-	if (status == 0)
+	if (s.ok ())
 	{
-		result = value.uint256 ();
+		result = rai::account::from_raw_string (val);
 	}
 	return result;
 }
@@ -1126,6 +1372,10 @@ void rai::block_store::frontier_del (MDB_txn * transaction_a, rai::block_hash co
 {
 	auto status (mdb_del (transaction_a, frontiers, rai::mdb_val (block_a), nullptr));
 	assert (status == 0);
+
+	rocksdb::Slice ks = block_a.to_slice ();
+	auto s = frontiers_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
 }
 
 size_t rai::block_store::frontier_count (MDB_txn * transaction_a)
@@ -1141,18 +1391,48 @@ void rai::block_store::account_put (MDB_txn * transaction_a, rai::account const 
 {
 	auto status (mdb_put (transaction_a, accounts, rai::mdb_val (account_a), info_a.val (), 0));
 	assert (status == 0);
+
+	rocksdb::Slice ks = account_a.to_slice ();
+	rocksdb::Slice vs{ reinterpret_cast<const char *> (&info_a), sizeof (info_a) };
+	auto s = accounts_db->Put (rocksdb::WriteOptions (), ks, vs);
+	assert (s.ok ());
 }
 
 void rai::block_store::pending_put (MDB_txn * transaction_a, rai::pending_key const & key_a, rai::pending_info const & pending_a)
 {
 	auto status (mdb_put (transaction_a, pending, key_a.val (), pending_a.val (), 0));
 	assert (status == 0);
+
+	std::vector<uint8_t> key_vector;
+	{
+		rai::vectorstream stream (key_vector);
+		key_a.serialize (stream);
+	}
+	std::vector<uint8_t> info_vector;
+	{
+		rai::vectorstream stream (info_vector);
+		pending_a.serialize (stream);
+	}
+	rocksdb::Slice ks{ reinterpret_cast<const char *> (key_vector.data ()), key_vector.size () };
+	rocksdb::Slice vs{ reinterpret_cast<const char *> (info_vector.data ()), info_vector.size () };
+	auto s = pending_db->Put (rocksdb::WriteOptions (), ks, vs);
+	assert (s.ok ());
 }
 
 void rai::block_store::pending_del (MDB_txn * transaction_a, rai::pending_key const & key_a)
 {
-	auto status (mdb_del (transaction_a, pending, key_a.val (), nullptr));
+	auto key_val = key_a.val ();
+	auto status (mdb_del (transaction_a, pending, key_val, nullptr));
 	assert (status == 0);
+
+	std::vector<uint8_t> key_vector;
+	{
+		rai::vectorstream stream (key_vector);
+		key_a.serialize (stream);
+	}
+	rocksdb::Slice ks{ reinterpret_cast<const char *> (key_vector.data ()), key_vector.size () };
+	auto s = pending_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
 }
 
 bool rai::block_store::pending_exists (MDB_txn * transaction_a, rai::pending_key const & key_a)
@@ -1163,19 +1443,25 @@ bool rai::block_store::pending_exists (MDB_txn * transaction_a, rai::pending_key
 
 bool rai::block_store::pending_get (MDB_txn * transaction_a, rai::pending_key const & key_a, rai::pending_info & pending_a)
 {
-	rai::mdb_val value;
-	auto status (mdb_get (transaction_a, pending, key_a.val (), value));
-	assert (status == 0 || status == MDB_NOTFOUND);
+	std::vector<uint8_t> key_vector;
+	{
+		rai::vectorstream stream (key_vector);
+		key_a.serialize (stream);
+	}
+	rocksdb::Slice ks{ reinterpret_cast<const char *> (key_vector.data ()), key_vector.size () };
+	std::string val{};
+	auto s = pending_db->Get (rocksdb::ReadOptions (), ks, &val);
+	assert (s.ok () || s.IsNotFound ());
 	bool result;
-	if (status == MDB_NOTFOUND)
+	if (s.IsNotFound ())
 	{
 		result = true;
 	}
 	else
 	{
 		result = false;
-		assert (value.size () == sizeof (pending_a.source.bytes) + sizeof (pending_a.amount.bytes));
-		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data ()), value.size ());
+		assert (val.size () == sizeof (pending_a.source.bytes) + sizeof (pending_a.amount.bytes));
+		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (val.data ()), val.size ());
 		auto error1 (rai::read (stream, pending_a.source));
 		assert (!error1);
 		auto error2 (rai::read (stream, pending_a.amount));
@@ -1288,14 +1574,29 @@ rai::mdb_val rai::pending_key::val () const
 
 void rai::block_store::block_info_put (MDB_txn * transaction_a, rai::block_hash const & hash_a, rai::block_info const & block_info_a)
 {
-	auto status (mdb_put (transaction_a, blocks_info, rai::mdb_val (hash_a), block_info_a.val (), 0));
+	auto block_info_val = block_info_a.val ();
+	auto status (mdb_put (transaction_a, blocks_info, rai::mdb_val (hash_a), block_info_val, 0));
 	assert (status == 0);
+
+	rocksdb::Slice ks = hash_a.to_slice ();
+	std::vector<uint8_t> info_vector;
+	{
+		rai::vectorstream stream (info_vector);
+		block_info_a.serialize (stream);
+	}
+	rocksdb::Slice vs{ reinterpret_cast<const char *> (info_vector.data ()), info_vector.size () };
+	auto s = blocks_info_db->Put (rocksdb::WriteOptions (), ks, vs);
+	assert (s.ok ());
 }
 
 void rai::block_store::block_info_del (MDB_txn * transaction_a, rai::block_hash const & hash_a)
 {
 	auto status (mdb_del (transaction_a, blocks_info, rai::mdb_val (hash_a), nullptr));
 	assert (status == 0);
+
+	rocksdb::Slice ks = hash_a.to_slice ();
+	auto s = blocks_info_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
 }
 
 bool rai::block_store::block_info_exists (MDB_txn * transaction_a, rai::block_hash const & hash_a)
@@ -1306,19 +1607,20 @@ bool rai::block_store::block_info_exists (MDB_txn * transaction_a, rai::block_ha
 
 bool rai::block_store::block_info_get (MDB_txn * transaction_a, rai::block_hash const & hash_a, rai::block_info & block_info_a)
 {
-	rai::mdb_val value;
-	auto status (mdb_get (transaction_a, blocks_info, rai::mdb_val (hash_a), value));
-	assert (status == 0 || status == MDB_NOTFOUND);
+	std::string val{};
+	rocksdb::Slice ks = hash_a.to_slice ();
+	auto s = blocks_info_db->Get (rocksdb::ReadOptions (), ks, &val);
+	assert (s.ok () || s.IsNotFound ());
 	bool result;
-	if (status == MDB_NOTFOUND)
+	if (s.IsNotFound ())
 	{
 		result = true;
 	}
 	else
 	{
 		result = false;
-		assert (value.size () == sizeof (block_info_a.account.bytes) + sizeof (block_info_a.balance.bytes));
-		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data ()), value.size ());
+		assert (val.size () == sizeof (block_info_a.account.bytes) + sizeof (block_info_a.balance.bytes));
+		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (val.data ()), val.size ());
 		auto error1 (rai::read (stream, block_info_a.account));
 		assert (!error1);
 		auto error2 (rai::read (stream, block_info_a.balance));
@@ -1392,14 +1694,15 @@ rai::mdb_val rai::block_info::val () const
 
 rai::uint128_t rai::block_store::representation_get (MDB_txn * transaction_a, rai::account const & account_a)
 {
-	rai::mdb_val value;
-	auto status (mdb_get (transaction_a, representation, rai::mdb_val (account_a), value));
-	assert (status == 0 || status == MDB_NOTFOUND);
+	std::string val{};
+	rocksdb::Slice ks = account_a.to_slice ();
+	auto s = representation_db->Get (rocksdb::ReadOptions (), ks, &val);
+	assert (s.ok () || s.IsNotFound ());
 	rai::uint128_t result;
-	if (status == 0)
+	if (s.ok ())
 	{
 		rai::uint128_union rep;
-		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data ()), value.size ());
+		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (val.data ()), val.size ());
 		auto error (rai::read (stream, rep));
 		assert (!error);
 		result = rep.number ();
@@ -1416,6 +1719,11 @@ void rai::block_store::representation_put (MDB_txn * transaction_a, rai::account
 	rai::uint128_union rep (representation_a);
 	auto status (mdb_put (transaction_a, representation, rai::mdb_val (account_a), rai::mdb_val (rep), 0));
 	assert (status == 0);
+
+	rocksdb::Slice ks = account_a.to_slice ();
+	rocksdb::Slice vs = rep.to_slice ();
+	auto s = representation_db->Put (rocksdb::WriteOptions (), ks, vs);
+	assert (s.ok ());
 }
 
 rai::store_iterator rai::block_store::representation_begin (MDB_txn * transaction_a)
@@ -1483,6 +1791,11 @@ void rai::block_store::unchecked_del (MDB_txn * transaction_a, rai::block_hash c
 	}
 	auto status (mdb_del (transaction_a, unchecked, rai::mdb_val (hash_a), rai::mdb_val (vector.size (), vector.data ())));
 	assert (status == 0 || status == MDB_NOTFOUND);
+
+	// TODO(elliott): Make this a check and delete.
+	rocksdb::Slice ks = hash_a.to_slice ();
+	auto s = unchecked_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
 }
 
 rai::store_iterator rai::block_store::unchecked_begin (MDB_txn * transaction_a)
@@ -1516,12 +1829,20 @@ void rai::block_store::unsynced_put (MDB_txn * transaction_a, rai::block_hash co
 {
 	auto status (mdb_put (transaction_a, unsynced, rai::mdb_val (hash_a), rai::mdb_val (0, nullptr), 0));
 	assert (status == 0);
+
+	rocksdb::Slice ks = hash_a.to_slice ();
+	auto s = unsynced_db->Put (rocksdb::WriteOptions (), ks, std::string{ 0, 1 });
+	assert (s.ok ());
 }
 
 void rai::block_store::unsynced_del (MDB_txn * transaction_a, rai::block_hash const & hash_a)
 {
 	auto status (mdb_del (transaction_a, unsynced, rai::mdb_val (hash_a), nullptr));
 	assert (status == 0);
+
+	rocksdb::Slice ks = hash_a.to_slice ();
+	auto s = unsynced_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
 }
 
 bool rai::block_store::unsynced_exists (MDB_txn * transaction_a, rai::block_hash const & hash_a)
@@ -1551,20 +1872,26 @@ void rai::block_store::checksum_put (MDB_txn * transaction_a, uint64_t prefix, u
 	uint64_t key (prefix | mask);
 	auto status (mdb_put (transaction_a, checksum, rai::mdb_val (sizeof (key), &key), rai::mdb_val (hash_a), 0));
 	assert (status == 0);
+
+	rocksdb::Slice ks{ reinterpret_cast<const char *> (&key), sizeof (key) };
+	rocksdb::Slice vs = hash_a.to_slice ();
+	auto s = checksum_db->Put (rocksdb::WriteOptions (), ks, vs);
+	assert (s.ok ());
 }
 
 bool rai::block_store::checksum_get (MDB_txn * transaction_a, uint64_t prefix, uint8_t mask, rai::uint256_union & hash_a)
 {
 	assert ((prefix & 0xff) == 0);
 	uint64_t key (prefix | mask);
-	rai::mdb_val value;
-	auto status (mdb_get (transaction_a, checksum, rai::mdb_val (sizeof (key), &key), value));
-	assert (status == 0 || status == MDB_NOTFOUND);
+	std::string val{};
+	rocksdb::Slice ks{ reinterpret_cast<const char *> (&key), sizeof (key) };
+	auto s = checksum_db->Get (rocksdb::ReadOptions (), ks, &val);
+	assert (s.ok () || s.IsNotFound ());
 	bool result;
-	if (status == 0)
+	if (s.ok ())
 	{
 		result = false;
-		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value.data ()), value.size ());
+		rai::bufferstream stream (reinterpret_cast<uint8_t const *> (val.data ()), val.size ());
 		auto error (rai::read (stream, hash_a));
 		assert (!error);
 	}
@@ -1581,6 +1908,10 @@ void rai::block_store::checksum_del (MDB_txn * transaction_a, uint64_t prefix, u
 	uint64_t key (prefix | mask);
 	auto status (mdb_del (transaction_a, checksum, rai::mdb_val (sizeof (key), &key), nullptr));
 	assert (status == 0);
+
+	rocksdb::Slice ks{ reinterpret_cast<const char *> (&key), sizeof (key) };
+	auto s = checksum_db->Delete (rocksdb::WriteOptions (), ks);
+	assert (s.ok ());
 }
 
 void rai::block_store::flush (MDB_txn * transaction_a)
@@ -1601,6 +1932,11 @@ void rai::block_store::flush (MDB_txn * transaction_a)
 		}
 		auto status (mdb_put (transaction_a, unchecked, rai::mdb_val (i.first), rai::mdb_val (vector.size (), vector.data ()), 0));
 		assert (status == 0);
+
+		rocksdb::Slice ks = i.first.to_slice ();
+		rocksdb::Slice vs{ reinterpret_cast<const char *> (vector.data ()), vector.size () };
+		auto s = unchecked_db->Put (rocksdb::WriteOptions (), ks, vs);
+		assert (s.ok ());
 	}
 	for (auto i (sequence_cache_l.begin ()), n (sequence_cache_l.end ()); i != n; ++i)
 	{
@@ -1611,6 +1947,11 @@ void rai::block_store::flush (MDB_txn * transaction_a)
 		}
 		auto status1 (mdb_put (transaction_a, vote, rai::mdb_val (i->first), rai::mdb_val (vector.size (), vector.data ()), 0));
 		assert (status1 == 0);
+
+		rocksdb::Slice ks = i->first.to_slice ();
+		rocksdb::Slice vs{ reinterpret_cast<const char *> (vector.data ()), vector.size () };
+		auto s = vote_db->Put (rocksdb::WriteOptions (), ks, vs);
+		assert (s.ok ());
 	}
 }
 
@@ -1627,12 +1968,12 @@ rai::store_iterator rai::block_store::vote_end ()
 std::shared_ptr<rai::vote> rai::block_store::vote_get (MDB_txn * transaction_a, rai::account const & account_a)
 {
 	std::shared_ptr<rai::vote> result;
-	rai::mdb_val value;
-	auto status (mdb_get (transaction_a, vote, rai::mdb_val (account_a), value));
-	assert (status == 0 || status == MDB_NOTFOUND);
-	if (status == 0)
+	std::string val{};
+	rocksdb::Slice ks = account_a.to_slice ();
+	auto s = vote_db->Get (rocksdb::ReadOptions (), ks, &val);
+	if (s.ok ())
 	{
-		result = std::make_shared<rai::vote> (value);
+		result = std::make_shared<rai::vote> (val);
 		assert (result != nullptr);
 	}
 	return result;
@@ -2589,6 +2930,19 @@ signature (rai::sign_message (prv_a, account_a, hash ()))
 rai::vote::vote (MDB_val const & value_a)
 {
 	rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value_a.mv_data), value_a.mv_size);
+	auto error (rai::read (stream, account.bytes));
+	assert (!error);
+	error = rai::read (stream, signature.bytes);
+	assert (!error);
+	error = rai::read (stream, sequence);
+	assert (!error);
+	block = rai::deserialize_block (stream);
+	assert (block != nullptr);
+}
+
+rai::vote::vote (std::string const & value_a)
+{
+	rai::bufferstream stream (reinterpret_cast<uint8_t const *> (value_a.data ()), value_a.size ());
 	auto error (rai::read (stream, account.bytes));
 	assert (!error);
 	error = rai::read (stream, signature.bytes);
